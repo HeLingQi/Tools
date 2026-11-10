@@ -12,6 +12,12 @@ export interface GoalStep {
 	status: GoalStepStatus;
 }
 
+export interface GoalCompletion {
+	completedAt: string;
+	durationMs?: number;
+	totalTokens?: number;
+}
+
 export interface GoalState {
 	goalId: string;
 	text: string;
@@ -27,6 +33,7 @@ export interface GoalState {
 	lastContinuationReason?: string;
 	noProgressTurns: number;
 	lastProgressAt?: string;
+	completion?: GoalCompletion;
 }
 
 export type GoalEvent =
@@ -44,7 +51,7 @@ export type GoalEvent =
 			note?: string;
 			at: string;
 	  }
-	| { kind: "status"; goalId: string; status: GoalStatus; reason?: string; at: string }
+	| { kind: "status"; goalId: string; status: GoalStatus; reason?: string; completion?: GoalCompletion; at: string }
 	| { kind: "continuation"; goalId: string; action: "queued" | "skipped" | "stopped"; reason: string; at: string };
 
 export interface HistoryEntry {
@@ -55,6 +62,8 @@ export interface SessionEntryLike {
 	type?: string;
 	customType?: string;
 	data?: unknown;
+	message?: { role?: string; usage?: unknown };
+	usage?: unknown;
 }
 
 export function nowIso(): string {
@@ -74,6 +83,61 @@ export function createGoalEvent(text: string, mode: GoalMode = "assist"): GoalEv
 		mode,
 		at,
 	};
+}
+
+function isGoalCompletion(value: unknown): value is GoalCompletion {
+	if (!value || typeof value !== "object") return false;
+	const completion = value as { completedAt?: unknown; durationMs?: unknown; totalTokens?: unknown };
+	return typeof completion.completedAt === "string"
+		&& (completion.durationMs === undefined || (typeof completion.durationMs === "number" && Number.isFinite(completion.durationMs) && completion.durationMs >= 0))
+		&& (completion.totalTokens === undefined || (typeof completion.totalTokens === "number" && Number.isFinite(completion.totalTokens) && completion.totalTokens >= 0));
+}
+
+function usageTokens(value: unknown): number | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const usage = value as Record<string, unknown>;
+	if (typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens) && usage.totalTokens >= 0) return usage.totalTokens;
+	const values = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
+		.filter((item): item is number => typeof item === "number" && Number.isFinite(item) && item >= 0);
+	return values.length > 0 ? values.reduce((sum, item) => sum + item, 0) : undefined;
+}
+
+function entryUsage(entry: SessionEntryLike): unknown {
+	if (entry.type === "message" && (entry.message?.role === "assistant" || entry.message?.role === "toolResult")) return entry.message.usage;
+	if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") return entry.usage;
+	return undefined;
+}
+
+export function calculateGoalCompletion(
+	entries: SessionEntryLike[],
+	goalId: string,
+	createdAt: string,
+	completedAt: string,
+	completionIndex = entries.length,
+): GoalCompletion {
+	const completion: GoalCompletion = { completedAt };
+	const started = Date.parse(createdAt);
+	const finished = Date.parse(completedAt);
+	if (Number.isFinite(started) && Number.isFinite(finished) && finished >= started) completion.durationMs = finished - started;
+
+	let createdIndex = -1;
+	for (let index = 0; index < completionIndex; index++) {
+		const entry = entries[index];
+		if (entry.type === "custom" && entry.customType === GOAL_EVENT && isGoalEvent(entry.data)
+			&& entry.data.kind === "created" && entry.data.goalId === goalId) createdIndex = index;
+	}
+	if (createdIndex < 0) return completion;
+
+	let totalTokens = 0;
+	let hasUsage = false;
+	for (let index = createdIndex + 1; index < completionIndex; index++) {
+		const tokens = usageTokens(entryUsage(entries[index]));
+		if (tokens === undefined) continue;
+		totalTokens += tokens;
+		hasUsage = true;
+	}
+	if (hasUsage) completion.totalTokens = totalTokens;
+	return completion;
 }
 
 export function applyGoalEvent(state: GoalState | undefined, event: GoalEvent): GoalState | undefined {
@@ -117,6 +181,7 @@ export function applyGoalEvent(state: GoalState | undefined, event: GoalEvent): 
 				summary: event.status === "completed" && event.reason ? event.reason : state.summary,
 				noProgressTurns: event.status === "active" && state.status !== "active" ? 0 : state.noProgressTurns,
 				lastContinuationReason: event.reason,
+				completion: state.completion ?? (event.status === "completed" && isGoalCompletion(event.completion) ? event.completion : undefined),
 			};
 		case "continuation":
 			return {
@@ -149,6 +214,20 @@ export function reconstructGoal(entries: SessionEntryLike[]): { state?: GoalStat
 	let state: GoalState | undefined;
 	for (const { event } of history) {
 		state = applyGoalEvent(state, event);
+	}
+	if (state) {
+		for (let index = 0; index < entries.length; index++) {
+			const entry = entries[index];
+			if (entry.type !== "custom" || entry.customType !== GOAL_EVENT || !isGoalEvent(entry.data)
+				|| entry.data.kind !== "status" || entry.data.goalId !== state.goalId || entry.data.status !== "completed") continue;
+			state = {
+				...state,
+				completion: isGoalCompletion(entry.data.completion)
+					? entry.data.completion
+					: calculateGoalCompletion(entries, state.goalId, state.createdAt, entry.data.at, index),
+			};
+			break;
+		}
 	}
 	return { state, history };
 }

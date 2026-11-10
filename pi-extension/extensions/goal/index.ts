@@ -1,9 +1,11 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { formatGoalLines, formatGoalMarkdown } from "./format";
 import { buildGoalContinuationPrompt, buildGoalSteeringPrompt } from "./prompts";
 import {
 	applyGoalEvent,
+	calculateGoalCompletion,
 	createGoalEvent,
 	GOAL_CONTINUATION_CONTEXT,
 	GOAL_EVENT,
@@ -48,9 +50,13 @@ function readGoal(ctx: ExtensionContext): ReturnType<typeof reconstructGoal> {
 }
 
 function appendGoalEvent(pi: ExtensionAPI, ctx: ExtensionContext, event: GoalEvent): GoalState | undefined {
-	const base = readGoal(ctx).state;
-	pi.appendEntry(GOAL_EVENT, event);
-	const current = applyGoalEvent(base, event);
+	const entries = getBranch(ctx);
+	const base = reconstructGoal(entries).state;
+	const settledEvent = event.kind === "status" && event.status === "completed" && base?.goalId === event.goalId
+		? { ...event, completion: base.completion ?? calculateGoalCompletion(entries, event.goalId, base.createdAt, event.at) }
+		: event;
+	pi.appendEntry(GOAL_EVENT, settledEvent);
+	const current = applyGoalEvent(base, settledEvent);
 	refreshGoalUi(ctx, current);
 	return current;
 }
@@ -83,6 +89,18 @@ function getGoalResult(state: GoalState | undefined, history: GoalEvent[] = []) 
 		content: [{ type: "text" as const, text: formatGoalMarkdown(state, history) }],
 		details: { ok: true, goal: state, history: history.slice(-MAX_HISTORY_EVENTS) },
 	};
+}
+
+// 目标面板是状态摘要而非 Markdown 文档，直接染黄比让 Markdown 渲染器处理列表与加粗更清晰。
+function renderGoalResult(
+	result: { content: unknown },
+	_options: unknown,
+	theme: { fg(color: string, text: string): string },
+	context: { isError: boolean },
+) {
+	const text = extractTextContent(result.content);
+	const color = context.isError ? "error" : "warning";
+	return new Text(text.split("\n").map((line) => theme.fg(color, line)).join("\n"), 0, 0);
 }
 
 function extractTextContent(content: unknown): string {
@@ -294,6 +312,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 		promptSnippet: "Inspect the active session goal and progress",
 		promptGuidelines: ["Use get_goal before substantial work when a session goal is active and you need current structured progress."],
 		parameters: Type.Object({ includeHistory: Type.Optional(Type.Boolean({ description: "Include recent goal event history." })) }),
+		renderResult: renderGoalResult,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { state, history } = readGoal(ctx);
 			refreshGoalUi(ctx, state);
@@ -315,6 +334,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 			mode: Type.Optional(MODE_SCHEMA),
 			replace: Type.Optional(Type.Boolean({ description: "Replace an existing active goal." })),
 		}),
+		renderResult: renderGoalResult,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { state } = readGoal(ctx);
 			if (!params.goal.trim()) return getErrorResult("Goal text is required.");
@@ -351,6 +371,7 @@ export default function goalExtension(pi: ExtensionAPI): void {
 				),
 			),
 		}),
+		renderResult: renderGoalResult,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { state } = readGoal(ctx);
 			if (!state) return getErrorResult("No active goal. Use create_goal first.");

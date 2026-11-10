@@ -9,6 +9,14 @@ const packageRoot = resolve(dirname(realpathSync(execFileSync('which', ['pi'], {
 const { loadExtensions, clearExtensionCache } = await import(join(packageRoot, 'dist/core/extensions/loader.js'));
 const extensionPath = fileURLToPath(new URL('../extensions/goal/index.ts', import.meta.url));
 
+function recordedUsage(totalTokens, fields = {}) {
+  return {
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    ...fields,
+  };
+}
+
 async function load(entries = []) {
   clearExtensionCache();
   const loaded = await loadExtensions([extensionPath], '/tmp');
@@ -101,6 +109,91 @@ await test('goal 本地扩展', async (t) => {
     const done = await h.call('update_goal', { status: 'completed', summary: '已验证' });
     assert.notEqual(done.terminate, true);
     assert.notEqual((await h.settle())?.continue, true);
+  });
+
+  await t.test('完成时只结算当前目标创建后的 Pi 已记录 usage，并优先 totalTokens', async () => {
+    const wrap = (data) => ({ type: 'custom', customType: 'goal-event', data });
+    const createdAt = new Date(Date.now() - 5000).toISOString();
+    const h = await load([
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(900) } },
+      wrap({ kind: 'created', goalId: 'current', text: '统计当前目标', mode: 'assist', at: createdAt }),
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(100, { input: 10, output: 20, cacheRead: 30, cacheWrite: 40 }) } },
+      { type: 'message', message: { role: 'toolResult', toolName: 'delegate', usage: recordedUsage(25) } },
+      { type: 'compaction', usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 } },
+      { type: 'branch_summary', usage: recordedUsage(8) },
+      { type: 'usage', usage: recordedUsage(9) },
+    ]);
+
+    const result = await h.call('update_goal', { status: 'completed', summary: '已完成' });
+    const completion = result.details.goal.completion;
+    assert.equal(completion.totalTokens, 152);
+    assert.ok(completion.durationMs >= 5000 && completion.durationMs < 60000, completion.durationMs);
+    const persisted = h.entries.at(-1).data.completion;
+    assert.deepEqual(persisted, completion);
+    const completionLine = h.widgets.get('goal').find((value) => value.startsWith('总耗时:'));
+    assert.ok(completionLine);
+    assert.ok(result.content[0].text.includes(completionLine));
+    assert.ok(completionLine.includes('总 Token: 152'));
+  });
+
+  await t.test('两个目标严格隔离，完成后的重复消息和重复完成不改变首次快照', async () => {
+    const wrap = (data) => ({ type: 'custom', customType: 'goal-event', data });
+    const firstAt = '2026-01-01T00:00:00.000Z';
+    const secondAt = new Date(Date.now() - 3000).toISOString();
+    const h = await load([
+      wrap({ kind: 'created', goalId: 'first', text: '第一个', mode: 'assist', at: firstAt }),
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(40) } },
+      wrap({ kind: 'status', goalId: 'first', status: 'completed', at: '2026-01-01T00:00:10.000Z' }),
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(500) } },
+      wrap({ kind: 'created', goalId: 'second', text: '第二个', mode: 'assist', at: secondAt }),
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(7) } },
+    ]);
+
+    await h.call('update_goal', { status: 'completed', summary: '首次完成' });
+    const firstCompletion = structuredClone((await h.state()).completion);
+    assert.equal(firstCompletion.totalTokens, 7);
+    h.entries.push({ type: 'message', message: { role: 'assistant', usage: recordedUsage(999) } });
+    await h.command('done 再次完成');
+    assert.deepEqual((await h.state()).completion, firstCompletion);
+    assert.deepEqual(h.entries.at(-1).data.completion, firstCompletion);
+
+    const reloaded = await load(structuredClone(h.entries));
+    assert.deepEqual((await reloaded.state()).completion, firstCompletion);
+  });
+
+  await t.test('旧完成事件按首次完成边界恢复快照，分支 reload 不计完成后消息并统一展示耗时', async () => {
+    const wrap = (data) => ({ type: 'custom', customType: 'goal-event', data });
+    const branch = [
+      wrap({ kind: 'created', goalId: 'legacy', text: '旧目标', mode: 'assist', at: '2026-01-01T00:00:00.000Z' }),
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(12) } },
+      wrap({ kind: 'status', goalId: 'legacy', status: 'completed', reason: '完成', at: '2026-01-01T01:02:03.456Z' }),
+      { type: 'message', message: { role: 'assistant', usage: recordedUsage(999) } },
+    ];
+    const h = await load(structuredClone(branch));
+    const expected = { completedAt: '2026-01-01T01:02:03.456Z', durationMs: 3723456, totalTokens: 12 };
+    assert.deepEqual((await h.state()).completion, expected);
+    const line = '总耗时: 1小时 2分 3秒 · 总 Token: 12';
+    assert.ok((await h.call('get_goal')).content[0].text.includes(line));
+    await h.command('show');
+    assert.ok(h.notices.at(-1).includes(line));
+    assert.ok(h.widgets.get('goal').includes(line));
+
+    h.entries.length = 0;
+    await h.emit('session_tree');
+    assert.equal(await h.state(), undefined);
+    h.entries.push(...structuredClone(branch));
+    await h.emit('session_start');
+    assert.deepEqual((await h.state()).completion, expected);
+  });
+
+  await t.test('旧目标没有任何可读 usage 时明确显示 Token 不可用', async () => {
+    const wrap = (data) => ({ type: 'custom', customType: 'goal-event', data });
+    const h = await load([
+      wrap({ kind: 'created', goalId: 'legacy', text: '无 usage', mode: 'assist', at: '2026-01-01T00:00:00.000Z' }),
+      wrap({ kind: 'status', goalId: 'legacy', status: 'completed', at: '2026-01-01T00:00:01.000Z' }),
+    ]);
+    assert.deepEqual((await h.state()).completion, { completedAt: '2026-01-01T00:00:01.000Z', durationMs: 1000 });
+    assert.ok((await h.call('get_goal')).content[0].text.includes('总耗时: 1秒 · 总 Token: 不可用'));
   });
 
   await t.test('有实质进度可续跑 25 次，不受旧轮数限制', async () => {

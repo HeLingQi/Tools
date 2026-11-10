@@ -82,6 +82,10 @@ for (const scenario of ['completed', 'stalled', 'error', 'aborted', 'pause']) {
     const statuses = manager.getBranch().filter((entry) => entry.type === 'custom' && entry.customType === 'goal-event' && entry.data.kind === 'status');
     assert.deepEqual(errors, []);
     assert.equal(statuses.at(-1)?.data.status, scenario === 'completed' ? 'completed' : 'paused', JSON.stringify({ requests, tools: session.getActiveToolNames(), messages: session.messages.filter((message) => message.role === 'toolResult') }));
+    if (scenario === 'completed') {
+      assert.equal(statuses.at(-1).data.completion.totalTokens, 0);
+      assert.ok(statuses.at(-1).data.completion.durationMs >= 0);
+    }
     assert.equal(requests, scenario === 'completed' ? 50 : scenario === 'stalled' ? 3 : 1);
     assert.equal(manager.getBranch().some((entry) => entry.type === 'custom' && entry.data?.kind === 'accounting'), false);
     assert.equal(session.isStreaming, false);

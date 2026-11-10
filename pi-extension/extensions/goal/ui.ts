@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncate } from "./format";
+import { formatGoalCompletion, truncate } from "./format";
 import type { GoalState } from "./state";
 
 const STATUS_ID = "goal";
@@ -33,6 +33,8 @@ export function refreshGoalUi(ctx: ExtensionContext, state: GoalState | undefine
 		`🎯 Goal: ${truncate(state.text, 90)}`,
 		`mode: ${state.mode} · status: ${state.status}`,
 	];
+	const completion = formatGoalCompletion(state);
+	if (completion) lines.push(completion);
 	if (state.nextAction) lines.push(`next: ${truncate(state.nextAction, 82)}`);
 	else if (state.summary) lines.push(`progress: ${truncate(state.summary, 82)}`);
 	if (state.status === "paused" && state.lastContinuationReason) lines.push(`paused: ${truncate(state.lastContinuationReason, 82)}`);
